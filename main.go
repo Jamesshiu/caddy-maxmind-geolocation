@@ -6,14 +6,14 @@ package caddy_maxmind_geolocation
 
 import (
 	"fmt"
+	"net"
+	"net/http"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/oschwald/maxminddb-golang"
+	"github.com/ip2location/ip2location-go"
 	"go.uber.org/zap"
-	"net"
-	"net/http"
-	"strconv"
 )
 
 // Interface guards
@@ -77,7 +77,7 @@ type MaxmindGeolocation struct {
 	// You can specify the special value "UNK" to match unrecognized metro codes.
 	DenyMetroCodes []string `json:"deny_metro_codes"`
 
-	dbInst *maxminddb.Reader
+	dbInst *ip2location.DB
 	logger *zap.Logger
 }
 
@@ -151,7 +151,7 @@ func (MaxmindGeolocation) CaddyModule() caddy.ModuleInfo {
 func (m *MaxmindGeolocation) Provision(ctx caddy.Context) error {
 	var err error
 	m.logger = ctx.Logger(m)
-	m.dbInst, err = maxminddb.Open(m.DbPath)
+	m.dbInst, err = ip2location.OpenDB(m.DbPath)
 	if err != nil {
 		return fmt.Errorf("cannot open database file %s: %v", m.DbPath, err)
 	}
@@ -160,7 +160,7 @@ func (m *MaxmindGeolocation) Provision(ctx caddy.Context) error {
 
 func (m *MaxmindGeolocation) Cleanup() error {
 	if m.dbInst != nil {
-		return m.dbInst.Close()
+		m.dbInst.Close()
 	}
 	return nil
 }
@@ -192,7 +192,7 @@ func (m *MaxmindGeolocation) Match(r *http.Request) bool {
 
 	// If both the allow and deny fields are empty, let the request pass
 	if len(m.AllowCountries) < 1 && len(m.DenyCountries) < 1 {
-		return false
+		return true
 	}
 
 	remoteIp, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -206,44 +206,42 @@ func (m *MaxmindGeolocation) Match(r *http.Request) bool {
 		m.logger.Warn("cannot parse IP address", zap.String("address", r.RemoteAddr))
 		return false
 	}
-	var record Record
-	err = m.dbInst.Lookup(addr, &record)
+	var record ip2location.IP2Locationrecord
+	record, err = m.dbInst.Get_country_short(addr.String())
 	if err != nil {
 		m.logger.Warn("cannot lookup IP address", zap.String("address", r.RemoteAddr), zap.Error(err))
 		return false
 	}
 
 	m.logger.Debug(
-		"Detected MaxMind data",
+		"Detected ip2location data",
 		zap.String("ip", r.RemoteAddr),
-		zap.String("country", record.Country.ISOCode),
-		zap.String("subdivisions", record.Subdivisions.CommaSeparatedISOCodes()),
-		zap.Int("metro_code", record.Location.MetroCode),
+		zap.String("country", record.Country_short),
 	)
 
-	if !m.checkAllowed(record.Country.ISOCode, m.AllowCountries, m.DenyCountries) {
-		m.logger.Debug("Country not allowed", zap.String("country", record.Country.ISOCode))
+	if !m.checkAllowed(record.Country_short, m.AllowCountries, m.DenyCountries) {
+		m.logger.Debug("Country not allowed", zap.String("country", record.Country_short))
 		return false
 	}
 
-	if len(record.Subdivisions) > 0 {
-		for _, subdivision := range record.Subdivisions {
-			if !m.checkAllowed(subdivision.ISOCode, m.AllowSubdivisions, m.DenySubdivisions) {
-				m.logger.Debug("Subdivision not allowed", zap.String("subdivision", subdivision.ISOCode))
-				return false
-			}
-		}
-	} else {
-		if !m.checkAllowed("", m.AllowSubdivisions, m.DenySubdivisions) {
-			m.logger.Debug("Subdivision not allowed", zap.String("subdivision", ""))
-			return false
-		}
-	}
+	// if len(record.Subdivisions) > 0 {
+	// 	for _, subdivision := range record.Subdivisions {
+	// 		if !m.checkAllowed(subdivision.ISOCode, m.AllowSubdivisions, m.DenySubdivisions) {
+	// 			m.logger.Debug("Subdivision not allowed", zap.String("subdivision", subdivision.ISOCode))
+	// 			return false
+	// 		}
+	// 	}
+	// } else {
+	// 	if !m.checkAllowed("", m.AllowSubdivisions, m.DenySubdivisions) {
+	// 		m.logger.Debug("Subdivision not allowed", zap.String("subdivision", ""))
+	// 		return false
+	// 	}
+	// }
 
-	if !m.checkAllowed(strconv.Itoa(record.Location.MetroCode), m.AllowMetroCodes, m.DenyMetroCodes) {
-		m.logger.Debug("Metro code not allowed", zap.Int("metro_code", record.Location.MetroCode))
-		return false
-	}
+	// if !m.checkAllowed(strconv.Itoa(record.Location.MetroCode), m.AllowMetroCodes, m.DenyMetroCodes) {
+	// 	m.logger.Debug("Metro code not allowed", zap.Int("metro_code", record.Location.MetroCode))
+	// 	return false
+	// }
 
 	return true
 }
