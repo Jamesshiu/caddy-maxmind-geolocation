@@ -14,6 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/ip2location/ip2location-go"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Interface guards
@@ -32,8 +33,11 @@ func init() {
 // Allows to filter requests based on source IP country.
 type MaxmindGeolocation struct {
 
-	// The path of the MaxMind GeoLite2-Country.mmdb file.
+	// The path of the ip2location db file.
 	DbPath string `json:"db_path"`
+
+	// The path of the zap log
+	LogPath string `json:"log_path"`
 
 	// A list of countries that the filter will allow.
 	// If you specify this, you should not specify DenyCountries.
@@ -48,34 +52,6 @@ type MaxmindGeolocation struct {
 	// All countries that are not in this list will be allowed.
 	// You can specify the special value "UNK" to match unrecognized countries.
 	DenyCountries []string `json:"deny_countries"`
-
-	// A list of subdivisions that the filter will allow.
-	// If you specify this, you should not specify DenySubdivisions.
-	// If both are specified, DenySubdivisions will take precedence.
-	// All subdivisions that are not in this list will be denied.
-	// You can specify the special value "UNK" to match unrecognized subdivisions.
-	AllowSubdivisions []string `json:"allow_subdivisions"`
-
-	// A list of subdivisions that the filter will deny.
-	// If you specify this, you should not specify AllowSubdivisions.
-	// If both are specified, DenySubdivisions will take precedence.
-	// All subdivisions that are not in this list will be allowed.
-	// You can specify the special value "UNK" to match unrecognized subdivisions.
-	DenySubdivisions []string `json:"deny_subdivisions"`
-
-	// A list of metro codes that the filter will allow.
-	// If you specify this, you should not specify DenyMetroCodes.
-	// If both are specified, DenyMetroCodes will take precedence.
-	// All metro codes that are not in this list will be denied.
-	// You can specify the special value "UNK" to match unrecognized metro codes.
-	AllowMetroCodes []string `json:"allow_metro_codes"`
-
-	// A list of METRO CODES that the filter will deny.
-	// If you specify this, you should not specify AllowMetroCodes.
-	// If both are specified, DenyMetroCodes will take precedence.
-	// All metro codes that are not in this list will be allowed.
-	// You can specify the special value "UNK" to match unrecognized metro codes.
-	DenyMetroCodes []string `json:"deny_metro_codes"`
 
 	dbInst *ip2location.DB
 	logger *zap.Logger
@@ -107,14 +83,8 @@ func (m *MaxmindGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				current = 2
 			case "deny_countries":
 				current = 3
-			case "allow_subdivisions":
+			case "log_path":
 				current = 4
-			case "deny_subdivisions":
-				current = 5
-			case "allow_metro_codes":
-				current = 6
-			case "deny_metro_codes":
-				current = 7
 			default:
 				switch current {
 				case 1:
@@ -125,13 +95,8 @@ func (m *MaxmindGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				case 3:
 					m.DenyCountries = append(m.DenyCountries, d.Val())
 				case 4:
-					m.AllowSubdivisions = append(m.AllowSubdivisions, d.Val())
-				case 5:
-					m.DenySubdivisions = append(m.DenySubdivisions, d.Val())
-				case 6:
-					m.AllowMetroCodes = append(m.AllowMetroCodes, d.Val())
-				case 7:
-					m.DenyMetroCodes = append(m.DenyMetroCodes, d.Val())
+					m.LogPath = d.Val()
+					current = 0
 				default:
 					return fmt.Errorf("unexpected config parameter %s", d.Val())
 				}
@@ -150,7 +115,12 @@ func (MaxmindGeolocation) CaddyModule() caddy.ModuleInfo {
 
 func (m *MaxmindGeolocation) Provision(ctx caddy.Context) error {
 	var err error
-	m.logger = ctx.Logger(m)
+	if m.LogPath != "" {
+		m.logger, err = NewLogger(m.LogPath)
+		if err != nil {
+			return fmt.Errorf("cannot open log file %s: %v", m.LogPath, err)
+		}
+	}
 	m.dbInst, err = ip2location.OpenDB(m.DbPath)
 	if err != nil {
 		return fmt.Errorf("cannot open database file %s: %v", m.DbPath, err)
@@ -163,6 +133,16 @@ func (m *MaxmindGeolocation) Cleanup() error {
 		m.dbInst.Close()
 	}
 	return nil
+}
+
+func NewLogger(logPath string) (*zap.Logger, error) {
+	cfg := zap.NewProductionConfig()
+	cfg.OutputPaths = []string{
+		logPath,
+	}
+	cfg.Level.SetLevel(zapcore.DebugLevel)
+	cfg.DisableCaller = true
+	return cfg.Build()
 }
 
 func (m *MaxmindGeolocation) checkAllowed(item string, allowedList []string, deniedList []string) bool {
@@ -197,51 +177,42 @@ func (m *MaxmindGeolocation) Match(r *http.Request) bool {
 
 	remoteIp, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		m.logger.Warn("cannot split IP address", zap.String("address", r.RemoteAddr), zap.Error(err))
+		if m.logger != nil {
+			m.logger.Warn("cannot split IP address", zap.String("address", r.RemoteAddr), zap.Error(err))
+		}
 	}
 
 	// Get the record from the database
 	addr := net.ParseIP(remoteIp)
 	if addr == nil {
-		m.logger.Warn("cannot parse IP address", zap.String("address", r.RemoteAddr))
+		if m.logger != nil {
+			m.logger.Warn("cannot parse IP address", zap.String("address", r.RemoteAddr))
+		}
 		return false
 	}
 	var record ip2location.IP2Locationrecord
 	record, err = m.dbInst.Get_country_short(addr.String())
 	if err != nil {
-		m.logger.Warn("cannot lookup IP address", zap.String("address", r.RemoteAddr), zap.Error(err))
+		if m.logger != nil {
+			m.logger.Warn("cannot lookup IP address", zap.String("address", r.RemoteAddr), zap.Error(err))
+		}
 		return false
 	}
 
-	m.logger.Debug(
-		"Detected ip2location data",
-		zap.String("ip", r.RemoteAddr),
-		zap.String("country", record.Country_short),
-	)
+	if m.logger != nil {
+		m.logger.Debug(
+			"Detected ip2location data",
+			zap.String("ip", r.RemoteAddr),
+			zap.String("country", record.Country_short),
+		)
+	}
 
 	if !m.checkAllowed(record.Country_short, m.AllowCountries, m.DenyCountries) {
-		m.logger.Debug("Country not allowed", zap.String("country", record.Country_short))
+		if m.logger != nil {
+			m.logger.Debug("Country not allowed", zap.String("country", record.Country_short))
+		}
 		return false
 	}
-
-	// if len(record.Subdivisions) > 0 {
-	// 	for _, subdivision := range record.Subdivisions {
-	// 		if !m.checkAllowed(subdivision.ISOCode, m.AllowSubdivisions, m.DenySubdivisions) {
-	// 			m.logger.Debug("Subdivision not allowed", zap.String("subdivision", subdivision.ISOCode))
-	// 			return false
-	// 		}
-	// 	}
-	// } else {
-	// 	if !m.checkAllowed("", m.AllowSubdivisions, m.DenySubdivisions) {
-	// 		m.logger.Debug("Subdivision not allowed", zap.String("subdivision", ""))
-	// 		return false
-	// 	}
-	// }
-
-	// if !m.checkAllowed(strconv.Itoa(record.Location.MetroCode), m.AllowMetroCodes, m.DenyMetroCodes) {
-	// 	m.logger.Debug("Metro code not allowed", zap.Int("metro_code", record.Location.MetroCode))
-	// 	return false
-	// }
 
 	return true
 }
